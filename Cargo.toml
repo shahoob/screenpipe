@@ -69,3 +69,9 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[profile.pseudo-release]
+inherits = "release"
+opt-level = 0
+lto = false
+debug = true

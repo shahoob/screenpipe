@@ -27,7 +27,8 @@ use crate::{
 };
 
 pub struct DatabaseManager {
-    pub pool: SqlitePool,
+    pub read_pool: SqlitePool,
+    pub write_pool: SqlitePool,
 }
 
 impl DatabaseManager {
@@ -51,32 +52,37 @@ impl DatabaseManager {
             sqlx::Sqlite::create_database(&connection_string).await?;
         }
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(50)
-            .min_connections(3) // Minimum number of idle connections
+        let read_pool = SqlitePoolOptions::new()
+            .max_connections(25)
+            .min_connections(3)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect(&connection_string)
+            .await?;
+
+        let write_pool = SqlitePoolOptions::new()
+            .max_connections(25)
+            .min_connections(3)
             .acquire_timeout(Duration::from_secs(10))
             .connect(&connection_string)
             .await?;
 
         // Enable WAL mode
         sqlx::query("PRAGMA journal_mode = WAL;")
-            .execute(&pool)
+            .execute(&write_pool)
             .await?;
 
         // Enable SQLite's query result caching
-        // PRAGMA cache_size = -2000; -- Set cache size to 2MB
-        // PRAGMA temp_store = MEMORY; -- Store temporary tables and indices in memory
         sqlx::query("PRAGMA cache_size = -2000;")
-            .execute(&pool)
+            .execute(&read_pool)
             .await?;
         sqlx::query("PRAGMA temp_store = MEMORY;")
-            .execute(&pool)
+            .execute(&read_pool)
             .await?;
 
-        let db_manager = DatabaseManager { pool };
+        let db_manager = DatabaseManager { read_pool, write_pool };
 
         // Run migrations after establishing the connection
-        Self::run_migrations(&db_manager.pool).await?;
+        Self::run_migrations(&db_manager.write_pool).await?;
 
         Ok(db_manager)
     }
@@ -91,7 +97,7 @@ impl DatabaseManager {
     }
 
     pub async fn insert_audio_chunk(&self, file_path: &str) -> Result<i64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         let id = sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
             .bind(file_path)
             .bind(Utc::now())
@@ -105,7 +111,7 @@ impl DatabaseManager {
     async fn get_audio_chunk_id(&self, file_path: &str) -> Result<i64, sqlx::Error> {
         let id = sqlx::query_scalar::<_, i64>("SELECT id FROM audio_chunks WHERE file_path = ?1")
             .bind(file_path)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.read_pool)
             .await?;
         Ok(id.unwrap_or(0))
     }
@@ -126,7 +132,7 @@ impl DatabaseManager {
             "SELECT COUNT(*) FROM audio_transcriptions WHERE audio_chunk_id = ?1",
         )
         .bind(audio_chunk_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.read_pool)
         .await?;
         Ok(count)
     }
@@ -144,7 +150,7 @@ impl DatabaseManager {
         end_time: Option<f64>,
     ) -> Result<i64, sqlx::Error> {
         let text_length = transcription.len() as i64;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         // Insert the full transcription
         let id = sqlx::query(
@@ -177,7 +183,7 @@ impl DatabaseManager {
         transcription: &str,
     ) -> Result<i64, sqlx::Error> {
         let text_length = transcription.len() as i64;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         // Insert the full transcription
         let affected = sqlx::query(
@@ -196,7 +202,7 @@ impl DatabaseManager {
     }
 
     pub async fn insert_speaker(&self, embedding: &[f32]) -> Result<Speaker, SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         let id = sqlx::query("INSERT INTO speakers (name) VALUES (NULL)")
             .execute(&mut *tx)
@@ -225,7 +231,7 @@ impl DatabaseManager {
         speaker_id: i64,
         metadata: &str,
     ) -> Result<i64, SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         sqlx::query("UPDATE speakers SET metadata = ?1 WHERE id = ?2")
             .bind(metadata)
             .bind(speaker_id)
@@ -238,7 +244,7 @@ impl DatabaseManager {
     pub async fn get_speaker_by_id(&self, speaker_id: i64) -> Result<Speaker, SqlxError> {
         let speaker = sqlx::query_as("SELECT id, name, metadata FROM speakers WHERE id = ?1")
             .bind(speaker_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&self.read_pool)
             .await?;
         Ok(speaker)
     }
@@ -264,14 +270,14 @@ impl DatabaseManager {
         )
         .bind(bytes)
         .bind(speaker_threshold)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.read_pool)
         .await?;
 
         Ok(speaker)
     }
 
     pub async fn update_speaker_name(&self, speaker_id: i64, name: &str) -> Result<i64, SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         sqlx::query("UPDATE speakers SET name = ?1 WHERE id = ?2")
             .bind(name)
             .bind(speaker_id)
@@ -286,7 +292,7 @@ impl DatabaseManager {
         file_path: &str,
         device_name: &str,
     ) -> Result<i64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         let id = sqlx::query("INSERT INTO video_chunks (file_path, device_name) VALUES (?1, ?2)")
             .bind(file_path)
             .bind(device_name)
@@ -306,7 +312,7 @@ impl DatabaseManager {
         window_name: Option<&str>,
         focused: bool,
     ) -> Result<i64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         debug!("insert_frame Transaction started");
 
         // Get the most recent video_chunk_id and file_path
@@ -370,7 +376,7 @@ impl DatabaseManager {
         ocr_engine: Arc<OcrEngine>,
     ) -> Result<(), sqlx::Error> {
         let text_length = text.len() as i64;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         sqlx::query("INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)")
             .bind(frame_id)
             .bind(text)
@@ -776,7 +782,7 @@ impl DatabaseManager {
             })
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.read_pool)
             .await?;
 
         Ok(raw_results
@@ -905,7 +911,7 @@ impl DatabaseManager {
         }
         query_builder = query_builder.bind(limit as i64).bind(offset as i64);
 
-        let results_raw: Vec<AudioResultRaw> = query_builder.fetch_all(&self.pool).await?;
+        let results_raw: Vec<AudioResultRaw> = query_builder.fetch_all(&self.read_pool).await?;
 
         // map raw results into audio result type
         let futures: Vec<_> = results_raw
@@ -961,7 +967,7 @@ impl DatabaseManager {
             "#,
         )
         .bind(frame_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.read_pool)
         .await
     }
 
@@ -1169,7 +1175,7 @@ impl DatabaseManager {
                     .bind(min_length.map(|l| l as i64))
                     .bind(max_length.map(|l| l as i64))
                     .bind(frame_name)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&self.read_pool)
                     .await?
             }
             ContentType::UI => {
@@ -1179,7 +1185,7 @@ impl DatabaseManager {
                     .bind(end_time)
                     .bind(min_length.map(|l| l as i64))
                     .bind(max_length.map(|l| l as i64))
-                    .fetch_one(&self.pool)
+                    .fetch_one(&self.read_pool)
                     .await?
             }
             ContentType::Audio => {
@@ -1190,7 +1196,7 @@ impl DatabaseManager {
                     .bind(min_length.map(|l| l as i64))
                     .bind(max_length.map(|l| l as i64))
                     .bind(json_array)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&self.read_pool)
                     .await?
             }
             _ => {
@@ -1201,7 +1207,7 @@ impl DatabaseManager {
                     .bind(min_length.map(|l| l as i64))
                     .bind(max_length.map(|l| l as i64))
                     .bind(json_array)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&self.read_pool)
                     .await?
             }
         };
@@ -1221,26 +1227,26 @@ impl DatabaseManager {
     > {
         let latest_frame: Option<(DateTime<Utc>,)> =
             sqlx::query_as("SELECT timestamp FROM frames ORDER BY timestamp DESC LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.read_pool)
                 .await?;
 
         let latest_audio: Option<(DateTime<Utc>,)> =
             sqlx::query_as("SELECT timestamp FROM audio_chunks ORDER BY timestamp DESC LIMIT 1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.read_pool)
                 .await?;
 
         // Check if ui_monitoring table exists first
         let latest_ui: Option<(DateTime<Utc>,)> = match sqlx::query_scalar::<_, i32>(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ui_monitoring'",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.read_pool)
         .await?
         {
             Some(_) => {
                 sqlx::query_as(
                     "SELECT timestamp FROM ui_monitoring ORDER BY timestamp DESC LIMIT 1",
                 )
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.read_pool)
                 .await?
             }
             None => {
@@ -1269,7 +1275,7 @@ impl DatabaseManager {
     }
 
     async fn add_tags_to_vision(&self, frame_id: i64, tags: Vec<String>) -> Result<(), SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         for tag in tags {
             // Insert tag if it doesn't exist
@@ -1299,7 +1305,7 @@ impl DatabaseManager {
         audio_chunk_id: i64,
         tags: Vec<String>,
     ) -> Result<(), SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         for tag in tags {
             // Insert tag if it doesn't exist
@@ -1346,7 +1352,7 @@ impl DatabaseManager {
             "#,
         )
         .bind(vision_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await
     }
 
@@ -1361,7 +1367,7 @@ impl DatabaseManager {
             "#,
         )
         .bind(audio_chunk_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await
     }
 
@@ -1378,7 +1384,7 @@ impl DatabaseManager {
     }
 
     async fn remove_vision_tags(&self, vision_id: i64, tags: Vec<String>) -> Result<(), SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         for tag in tags {
             sqlx::query(
@@ -1402,7 +1408,7 @@ impl DatabaseManager {
         audio_chunk_id: i64,
         tags: Vec<String>,
     ) -> Result<(), SqlxError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         for tag in tags {
             sqlx::query(
@@ -1421,7 +1427,7 @@ impl DatabaseManager {
         Ok(())
     }
     pub async fn execute_raw_sql(&self, query: &str) -> Result<serde_json::Value, sqlx::Error> {
-        let rows = sqlx::query(query).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(query).fetch_all(&self.read_pool).await?;
 
         let result: Vec<serde_json::Map<String, serde_json::Value>> = rows
             .iter()
@@ -1505,11 +1511,11 @@ impl DatabaseManager {
             sqlx::query(frames_query)
                 .bind(start)
                 .bind(end)
-                .fetch_all(&self.pool),
+                .fetch_all(&self.read_pool),
             sqlx::query(audio_query)
                 .bind(start)
                 .bind(end)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.read_pool)
         )?;
 
         // Process into structured data with device-aware grouping
@@ -1644,7 +1650,7 @@ impl DatabaseManager {
             .bind(end_time)
             .bind(limit)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.read_pool)
             .await
     }
 
@@ -1660,7 +1666,7 @@ impl DatabaseManager {
             )
             .bind(ui_monitoring_id)
             .bind(tag_id)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         }
         Ok(())
@@ -1677,7 +1683,7 @@ impl DatabaseManager {
              WHERE ut.ui_monitoring_id = ?",
         )
         .bind(ui_monitoring_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await?;
 
         Ok(tags.into_iter().map(|t| t.0).collect())
@@ -1701,7 +1707,7 @@ impl DatabaseManager {
             "#,
         )
         .bind(speaker_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await
     }
 
@@ -1794,7 +1800,7 @@ impl DatabaseManager {
         // Add limit and offset last
         db_query = db_query.bind(limit).bind(offset);
 
-        let res = db_query.fetch_all(&self.pool).await?;
+        let res = db_query.fetch_all(&self.read_pool).await?;
         Ok(res)
     }
 
@@ -1803,7 +1809,7 @@ impl DatabaseManager {
         speaker_to_keep_id: i64,
         speaker_to_merge_id: i64,
     ) -> Result<Speaker, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         // for each audio transcription of the speaker to merge, update the speaker_id to the speaker to keep
         sqlx::query("UPDATE audio_transcriptions SET speaker_id = ? WHERE speaker_id = ?")
@@ -1835,12 +1841,12 @@ impl DatabaseManager {
             "SELECT DISTINCT * FROM speakers WHERE name LIKE ? || '%' AND hallucination = 0",
         )
         .bind(name_prefix)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await
     }
 
     pub async fn delete_speaker(&self, id: i64) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         // Array of (query, operation description) tuples
         let operations = [
@@ -1945,14 +1951,14 @@ impl DatabaseManager {
         .bind(speaker_id)
         .bind(threshold)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await
     }
 
     pub async fn mark_speaker_as_hallucination(&self, id: i64) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE speakers SET hallucination = TRUE WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
 
         Ok(())
@@ -1964,7 +1970,7 @@ impl DatabaseManager {
         frames: Vec<DynamicImage>,
         metadata: VideoMetadata,
     ) -> Result<Vec<i64>, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         debug!(
             "creating video chunk {}, metadata: {:?}",
             &file_path, &metadata
@@ -2024,7 +2030,7 @@ impl DatabaseManager {
         sqlx::query("INSERT INTO ocr_text_embeddings (frame_id, embedding) VALUES (?1, ?2)")
             .bind(frame_id)
             .bind(embedding)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         Ok(())
     }
@@ -2076,7 +2082,7 @@ impl DatabaseManager {
             .bind(bytes)
             .bind(threshold)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.read_pool)
             .await?;
 
         Ok(raw_results
@@ -2107,7 +2113,7 @@ impl DatabaseManager {
         sqlx::query("UPDATE frames SET name = ?1 WHERE id = ?2")
             .bind(name)
             .bind(frame_id)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         Ok(())
     }
@@ -2121,7 +2127,7 @@ impl DatabaseManager {
         sqlx::query("UPDATE frames SET name = ?1 WHERE video_chunk_id = ?2")
             .bind(name)
             .bind(video_chunk_id)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         Ok(())
     }
@@ -2137,7 +2143,7 @@ impl DatabaseManager {
         ];
 
         for step in emergency_steps {
-            if let Err(e) = sqlx::query(step).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(step).execute(&self.write_pool).await {
                 warn!("emergency step failed (continuing anyway): {}", e);
             }
         }
@@ -2150,7 +2156,7 @@ impl DatabaseManager {
         ];
 
         for step in wal_cleanup {
-            if let Err(e) = sqlx::query(step).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(step).execute(&self.write_pool).await {
                 warn!("wal cleanup failed (continuing anyway): {}", e);
             }
         }
@@ -2169,7 +2175,7 @@ impl DatabaseManager {
 
         for (query, step) in recovery_steps {
             debug!("running aggressive recovery step: {}", step);
-            match sqlx::query(query).execute(&self.pool).await {
+            match sqlx::query(query).execute(&self.write_pool).await {
                 Ok(_) => debug!("recovery step '{}' succeeded", step),
                 Err(e) => warn!("recovery step '{}' failed: {}", step, e),
             }
@@ -2186,14 +2192,14 @@ impl DatabaseManager {
         ];
 
         for step in restore_steps {
-            if let Err(e) = sqlx::query(step).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(step).execute(&self.write_pool).await {
                 warn!("restore step failed: {}", e);
             }
         }
 
         // Final verification
         match sqlx::query_scalar::<_, String>("PRAGMA quick_check;")
-            .fetch_one(&self.pool)
+            .fetch_one(&self.write_pool)
             .await
         {
             Ok(result) if result == "ok" => {
@@ -2318,7 +2324,7 @@ LIMIT ? OFFSET ?
         // Bind limit and offset
         query_builder = query_builder.bind(limit as i64).bind(offset as i64);
 
-        let rows = query_builder.fetch_all(&self.pool).await?;
+        let rows = query_builder.fetch_all(&self.read_pool).await?;
 
         Ok(rows
             .iter()

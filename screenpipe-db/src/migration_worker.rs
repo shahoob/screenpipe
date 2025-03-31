@@ -174,7 +174,7 @@ impl MigrationWorker {
         let handle = tokio::spawn(async move {
             // Start the migration process
             let result = migrate_ocr_data_to_frames(
-                &db.pool,
+                &db.write_pool,
                 config,
                 is_running.clone(),
                 is_paused.clone(),
@@ -200,8 +200,8 @@ impl MigrationWorker {
                     error!("Migration failed: {error_msg}");
 
                     // Try to get the current progress
-                    let processed = get_migration_progress(&db.pool).await.unwrap_or(0);
-                    let total = get_total_records(&db.pool).await.unwrap_or(0);
+                    let processed = get_migration_progress(&db.read_pool).await.unwrap_or(0);
+                    let total = get_total_records(&db.read_pool).await.unwrap_or(0);
 
                     let _ = status_tx
                         .send(MigrationResponse {

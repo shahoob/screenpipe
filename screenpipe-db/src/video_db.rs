@@ -8,7 +8,7 @@ impl DatabaseManager {
             "SELECT COUNT(*) FROM frames JOIN video_chunks ON frames.video_chunk_id = video_chunks.id WHERE video_chunks.file_path = ?1",
         )
         .bind(video_path.to_str().unwrap())
-        .fetch_one(&self.pool)
+        .fetch_one(&self.read_pool)
         .await
     }
     /// Retrieves a list of videos ordered by their start time.
@@ -20,7 +20,7 @@ impl DatabaseManager {
             ORDER BY id ASC
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await
     }
 
@@ -39,7 +39,7 @@ impl DatabaseManager {
             "#,
         )
         .bind(current_video_path)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.read_pool)
         .await
     }
 }
